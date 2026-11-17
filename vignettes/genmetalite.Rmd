@@ -1,0 +1,457 @@
+---
+title: "Pooling reduced regression models with genmetalite"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Pooling reduced regression models with genmetalite}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(genmetalite)
+set.seed(2026)
+```
+
+## The problem
+
+You want the coefficients of a regression of `y` on `x1`, `x2` and `x3`. No
+single study measured all three. Study 1 has `x1` and `x2`; study 2 has `x1` and
+`x3`; study 3 has `x2` and `x3`. Separately, a large reference sample — a
+national survey, a biobank — measured all three covariates but has no outcome.
+
+If the covariates were independent, you could simply meta-analyse the
+coefficients as reported. They are not: omitting `x3` from study 1 biases its
+`x2` coefficient, because `x3` is correlated with `x2` and its effect gets
+absorbed. Each study is estimating a different marginal effect, so averaging
+them averages incompatible quantities.
+
+## Simulating the situation
+
+```{r}
+make_pop <- function(n) {
+  x1 <- rnorm(n)
+  x2 <- 0.6 * x1 + rnorm(n, sd = 0.8)
+  x3 <- 0.4 * x2 + rnorm(n)
+  data.frame(x1 = x1, x2 = x2, x3 = x3)
+}
+
+beta <- c(x1 = 1, x2 = -0.5, x3 = 0.3)
+
+make_study <- function(n, drop) {
+  d <- make_pop(n)
+  d$y <- as.numeric(2 + as.matrix(d) %*% beta + rnorm(n))
+  d[, setdiff(names(d), drop), drop = FALSE]
+}
+
+ref <- make_pop(20000)
+cohorts <- list(
+  make_study(1500, "x3"),
+  make_study(1500, "x2"),
+  make_study(1500, "x1")
+)
+
+vapply(cohorts, function(d) paste(setdiff(names(d), "y"), collapse = ", "),
+  character(1)
+)
+```
+
+Note the conventions: the outcome is called `y` in every cohort, and the
+reference data have no outcome column at all.
+
+## Fitting
+
+```{r}
+fit <- calc_linear_beta(cohort_data = cohorts, ref_data = ref)
+summary(fit)
+```
+
+The `estimate` column is close to the truth. The `ivw.estimate` column — plain
+inverse-variance weighted meta-analysis of the same reduced models — is not:
+
+```{r}
+rbind(
+  truth = beta,
+  genmetalite = round(fit$linear_est$beta, 3),
+  IVW = round(fit$IVW_est$beta[names(beta)], 3)
+)
+```
+
+## Running the pipeline by hand
+
+`calc_linear_beta()` is a wrapper around three steps you can run yourself, which
+is useful when studies cannot share individual-level data.
+
+### 1. Fit the reduced models
+
+```{r}
+reduced <- lapply(cohorts, function(d) {
+  run_regression(
+    y = d$y,
+    X_s = d[, setdiff(names(d), "y"), drop = FALSE],
+    dgp = "linear"
+  )
+})
+reduced[[1]]
+```
+
+Each element carries the coefficients, a robust variance matrix and the
+empirical covariance of that study's own covariates. That is all a collaborating
+site needs to send you — no individual-level rows.
+
+If a site has already fitted the model, `as_reduced_model()` converts an `lm` or
+`glm` object into the same structure:
+
+```{r}
+fit_lm <- lm(y ~ x1 + x2, data = cohorts[[1]])
+as_reduced_model(fit_lm)$theta_hat_s
+```
+
+### 2. Assemble the covariances
+
+```{r}
+sig <- make_sigma_X_ls(
+  n_cohorts = 3,
+  reg_out = reduced,
+  ref_data = ref,
+  cohort_data = cohorts,
+  cov_p_type = "partitioned"
+)
+round(sig$sigma_X_ls[[1]], 3)
+```
+
+Study 1 measured `x1` and `x2`, so that block is its own covariance. Everything
+touching `x3` is borrowed from the reference population.
+
+### 3. Map and pool
+
+```{r}
+est <- linear_estimate(
+  n_cohorts = 3,
+  reg_out = reduced,
+  sigma_X_ls = sig$sigma_X_ls,
+  cov_cohort_X_s_ls = sig$cov_cohort_X_s_ls,
+  cohort_data = cohorts,
+  ref_pop_dummy = sig$ref_pop_dummy
+)
+est
+```
+
+The design maps show what the mapping is doing:
+
+```{r}
+round(est$A[[1]], 3)
+```
+
+Study 1's `x1` and `x2` coefficients map to themselves (the identity block), and
+the third column is the regression of the missing `x3` on the two observed
+covariates — the path through which `x3`'s effect leaked into study 1's
+estimates.
+
+## Where the standard errors come from
+
+```{r}
+data.frame(
+  naive = round(sqrt(diag(est$M)), 4),
+  full = round(sqrt(diag(est$var)), 4)
+)
+```
+
+`M` is the GLS variance you would get if the mapping `A_s` were known exactly.
+The full variance adds the cost of estimating it: an `O(1/n_ref)` term from the
+finite reference sample, and — under `cov_p_type = "partitioned"` — an
+`O(1/n_s)` term because each study's own covariance block is estimated on the
+same rows as its coefficients.
+
+Both extra terms need individual-level data. Without the reference rows:
+
+```{r}
+est_no_ref <- suppressWarnings(linear_estimate(
+  n_cohorts = 3,
+  reg_out = reduced,
+  sigma_X_ls = sig$sigma_X_ls,
+  cov_cohort_X_s_ls = sig$cov_cohort_X_s_ls,
+  cohort_data = NULL,
+  ref_pop_dummy = NULL
+))
+identical(unname(est_no_ref$var), unname(est_no_ref$M))
+```
+
+You get a warning and the naive variance. That is fine when the reference sample
+is enormous relative to the studies, and too small otherwise.
+
+## Choosing `cov_p_type`
+
+```{r}
+fit_part <- calc_linear_beta(
+  cohort_data = cohorts, ref_data = ref, cov_p_type = "partitioned"
+)
+fit_ref <- calc_linear_beta(
+  cohort_data = cohorts, ref_data = ref, cov_p_type = "reference"
+)
+
+rbind(
+  partitioned = round(fit_part$linear_est$beta, 3),
+  reference = round(fit_ref$linear_est$beta, 3),
+  truth = beta
+)
+```
+
+Here the studies and the reference are drawn from the same population, so the
+two agree. They diverge when a study's covariate distribution genuinely differs
+from the reference — which is exactly when you should think about reweighting.
+
+## Reweighting the reference
+
+If a study's covariate distribution differs from the reference population, the
+borrowed cross-moments describe the wrong population. Reweight first:
+
+```{r, eval = requireNamespace("ebal", quietly = TRUE)}
+fit_w <- calc_linear_beta(
+  cohort_data = cohorts,
+  ref_data = ref,
+  weighting.vars = c("x1", "x2", "x3"),
+  weighting.method = "ebal"
+)
+round(fit_w$linear_est$beta, 3)
+```
+
+`ebal_weights()` matches the requested moments exactly while keeping the weights
+tightly dispersed; `ipw_weights()` fits a logistic membership model and returns
+odds weights, with no extra package dependency. Either can be called directly if
+you want to inspect the weights before using them:
+
+```{r}
+w <- ipw_weights(cohorts[[1]][, c("x1", "x2")], ref[, c("x1", "x2")])
+summary(w$weights)
+```
+
+Weights are treated as fixed in the variance calculation. Estimating them
+contributes a further influence-function term that is not included, so standard
+errors under reweighting are mildly anti-conservative. A joint bootstrap over
+study and reference rows is the recommended check.
+
+## Constraining coefficients to zero
+
+Sometimes you want to shrink a coefficient to exactly zero — because theory says
+it is null, or because you want a nested model for comparison:
+
+```{r}
+fit_c <- calc_linear_beta(
+  cohort_data = cohorts, ref_data = ref, constr_vars = "x3"
+)
+round(fit_c$linear_est$beta, 4)
+```
+
+The constrained variance sandwiches the full influence-function variance by the
+projector, which is valid when the constraint really does hold in the
+population.
+
+## Categorical covariates
+
+Factors are expanded with `model.matrix()`, so a factor `edu` with levels
+`1, 2, 3` becomes `edu2` and `edu3`. The reference data and the cohorts must use
+the same levels, or the dummy names will not line up:
+
+```{r}
+n <- 4000
+make_pop2 <- function(n) {
+  data.frame(
+    age = rnorm(n),
+    edu = factor(sample(1:3, n, replace = TRUE, prob = c(.5, .3, .2)))
+  )
+}
+b2 <- c(age = 0.8, edu2 = -0.4, edu3 = 0.6)
+
+ref2 <- make_pop2(n)
+mk2 <- function(n, drop) {
+  d <- make_pop2(n)
+  X <- model.matrix(~., d)[, -1, drop = FALSE]
+  d$y <- as.numeric(1 + X %*% b2 + rnorm(n))
+  d[, setdiff(names(d), drop), drop = FALSE]
+}
+cohorts2 <- list(mk2(2000, "edu"), mk2(2000, character(0)))
+
+fit2 <- calc_linear_beta(cohort_data = cohorts2, ref_data = ref2)
+rbind(estimate = round(fit2$linear_est$beta, 3), truth = b2)
+```
+
+`check_vars()` will tell you in advance if a cohort has a level the reference
+population lacks:
+
+```{r}
+check_vars(
+  data.frame(g = factor(c("a", "b"))),
+  data.frame(g = factor(c("a", "c")))
+)
+```
+
+## Survey reference populations
+
+A reference population is a *sample*, and how it was drawn matters. `ref_data`
+accepts a `survey.design` object, or a `ref_design()` you build yourself:
+
+```{r}
+set.seed(77)
+n_str <- 8; n_psu <- 5; m <- 60
+N <- n_str * n_psu * m
+psu <- rep(seq_len(n_str * n_psu), each = m)
+strata <- rep(seq_len(n_str), each = n_psu * m)
+u <- rnorm(n_str * n_psu, sd = 0.9)[psu]   # PSU-level clustering
+sx1 <- u + rnorm(N)
+sx2 <- 0.6 * sx1 + rnorm(N, sd = 0.8)
+sx3 <- 0.4 * sx2 + rnorm(N)
+svy_ref <- ref_design(
+  data.frame(x1 = sx1, x2 = sx2, x3 = sx3),
+  weights = exp(rnorm(N, 0, 0.4)) * 100,
+  strata  = strata,
+  psu     = psu
+)
+svy_ref
+```
+
+```{r}
+fit_svy <- calc_linear_beta(cohort_data = cohorts, ref_data = svy_ref)
+fit_svy$linear_est$design_df
+```
+
+The design changes the variance without touching the point estimate — `Sigma`
+depends on the weights, the design enters only the variance:
+
+```{r}
+weights_only <- calc_linear_beta(
+  cohort_data = cohorts,
+  ref_data = ref_design(svy_ref$data, weights = svy_ref$weights)
+)
+rbind(
+  `weights only` = round(sqrt(diag(weights_only$linear_est$var)), 4),
+  `with design`  = round(sqrt(diag(fit_svy$linear_est$var)), 4)
+)
+identical(
+  round(weights_only$linear_est$beta, 12),
+  round(fit_svy$linear_est$beta, 12)
+)
+```
+
+Clustering inflates the reference term, as it should. With `design_df` this
+small, build confidence intervals from a *t* distribution rather than a normal:
+
+```{r}
+b  <- fit_svy$linear_est$beta
+se <- sqrt(diag(fit_svy$linear_est$var))
+crit <- qt(0.975, fit_svy$linear_est$design_df)
+round(cbind(estimate = b, lower = b - crit * se, upper = b + crit * se), 3)
+```
+
+If you use the survey package, pass the design object straight in and skip the
+manual construction:
+
+```{r, eval = requireNamespace("survey", quietly = TRUE)}
+des <- survey::svydesign(
+  id = ~psu, strata = ~strata, weights = ~w,
+  data = cbind(svy_ref$data, psu = psu, strata = strata, w = svy_ref$weights),
+  nest = TRUE
+)
+fit_des <- calc_linear_beta(cohort_data = cohorts, ref_data = des)
+all.equal(fit_des$linear_est$var, fit_svy$linear_est$var)
+```
+
+The design's `variables` slot carries `psu`, `strata` and `w` alongside the
+covariates; only the covariates the studies use enter the model, so there is no
+need to strip them first.
+
+For NHANES the call is the same shape:
+
+```{r, eval = FALSE}
+des <- survey::svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~WTMEC2YR,
+  data = nhanes, nest = TRUE
+)
+fit <- calc_linear_beta(cohort_data = cohorts, ref_data = des)
+```
+
+Finite population corrections are ignored, giving the with-replacement variance
+NCHS recommends. Calibrated or post-stratified designs get a warning and a
+conservative variance, since those adjustments are not propagated.
+
+### Reweighting a survey reference
+
+Reweighting composes with the design. The sampling weights become the base
+weights of the balancing problem, so each cohort ends up with one weight vector
+carrying both:
+
+```{r}
+fit_both <- calc_linear_beta(
+  cohort_data = cohorts,
+  ref_data = svy_ref,
+  weighting.vars = c("x1", "x2", "x3"),
+  weighting.method = "ebal"
+)
+
+## Cohort 1 measured x1 and x2; both are matched exactly.
+w1 <- fit_both$ref_weights[[1]]
+rbind(
+  `weighted reference` = c(
+    x1 = weighted.mean(svy_ref$data$x1, w1),
+    x2 = weighted.mean(svy_ref$data$x2, w1)
+  ),
+  cohort = c(x1 = mean(cohorts[[1]]$x1), x2 = mean(cohorts[[1]]$x2))
+)
+```
+
+The population total the survey weights represent survives the reweighting, and
+each cohort gets its own vector:
+
+```{r}
+c(
+  survey_total = sum(svy_ref$weights),
+  cohort1 = sum(fit_both$ref_weights[[1]]),
+  cohort2 = sum(fit_both$ref_weights[[2]])
+)
+fit_both$linear_est$design_df
+```
+
+Per-cohort weights and a shared design coexist because the per-cohort influence
+contributions are summed *before* the design is applied. The cohorts are all
+reweighting the same reference rows, so their contributions are correlated;
+summing first keeps that, whereas adding per-cohort variances would understate
+it.
+
+Weights are still treated as fixed. Estimating them contributes a further
+influence-function term that is not included, so standard errors under
+reweighting are mildly anti-conservative.
+
+## When a study is itself a complex sample
+
+The reference design is handled for you. A *study's* design is not:
+`linear_estimate()` takes each study's coefficient covariance as given, and the
+default sandwich assumes independent rows. For a clustered cohort, fit the model
+yourself and pass a cluster-robust matrix:
+
+```{r, eval = FALSE}
+fit_lm <- lm(y ~ x1 + x2, data = cohort1)
+rm1 <- as_reduced_model(
+  fit_lm,
+  vcov = function(f) sandwich::vcovCL(f, cluster = cohort1$psu)
+)
+```
+
+In simulation, clustered cohorts fitted with the plain sandwich dropped 95%
+interval coverage to about 0.89 even with the reference design handled
+correctly, so this is worth getting right when it applies.
+
+## Chaining fits
+
+A pooled estimate can act as one study in a second round of pooling, which is
+useful for combining consortia that have each run their own meta-analysis:
+
+```{r}
+rm_pooled <- as_reduced_model_genmetalite(fit, cov_X = cov(ref))
+rm_pooled$theta_hat_s
+```

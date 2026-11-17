@@ -1,0 +1,42 @@
+Package: genmetalite
+Type: Package
+Title: Generalized Meta-Analysis of Reduced Regression Models
+Version: 0.1.0
+Authors@R: c(
+    person("Emily", "Norton", email = "mlenorton@gmail.com",
+           role = c("aut", "cre"))
+    )
+Description: Combines coefficient estimates from several studies that each fit a
+    "reduced" regression model containing only a subset of the covariates in a
+    target "full" model. Following the generalized meta-analysis framework, the
+    reduced-model coefficients are mapped onto the full-model parameter using
+    covariate second moments borrowed from an external reference population, and
+    the mapped estimates are pooled by generalized least squares. Variance
+    estimation uses an influence-function sandwich that propagates uncertainty
+    from the reference sample and, when covariance blocks are taken from the
+    studies themselves, from the study samples. The reference population may be
+    reweighted to resemble each study by entropy balancing or inverse
+    probability weighting, and complex-survey reference samples (stratified,
+    clustered designs such as NHANES) are supported. Inverse-variance weighted
+    and empirical-Bayes style pooled estimators are provided for comparison.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.1.0)
+Imports:
+    sandwich,
+    stats,
+    utils
+Suggests:
+    MASS,
+    cobalt,
+    ebal,
+    knitr,
+    survey,
+    rmarkdown,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+RoxygenNote: 7.3.2
+Roxygen: list(markdown = TRUE)
+URL: https://github.com/mlenorton/genmetalite
+BugReports: https://github.com/mlenorton/genmetalite/issues
+VignetteBuilder: knitr
